@@ -1,0 +1,776 @@
+// 内存缓存
+const cache = new Map();
+const cacheExpiry = 30000; // 30秒缓存
+
+// 生成缓存键
+const generateCacheKey = (path, method, params = {}) => {
+  const paramString = Object.keys(params).sort().map(key => `${key}=${params[key]}`).join('&');
+  return `${method}:${path}${paramString ? '?' + paramString : ''}`;
+};
+
+// 检查缓存
+const getCached = (key) => {
+  const cached = cache.get(key);
+  if (cached && Date.now() - cached.timestamp < cacheExpiry) {
+    return cached.data;
+  }
+  cache.delete(key);
+  return null;
+};
+
+// 设置缓存
+const setCached = (key, data) => {
+  cache.set(key, {
+    data,
+    timestamp: Date.now()
+  });
+};
+
+// 清除缓存
+const clearCache = (pattern) => {
+  for (const key of cache.keys()) {
+    if (pattern && key.includes(pattern)) {
+      cache.delete(key);
+    }
+  }
+};
+
+export default {
+  async fetch(request, env) {
+    const corsHeaders = {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization",
+      "Content-Type": "application/json;charset=UTF-8"
+    };
+    
+    if (request.method === "OPTIONS") {
+      return new Response(null, { headers: corsHeaders });
+    }
+    
+    const url = new URL(request.url);
+    const method = request.method;
+    const getBJTime = () => new Date(Date.now() + 8 * 3600000).toISOString().replace('T',' ').substring(0,19);
+
+    // 错误处理中间件
+    const handleError = (error, status = 500) => {
+      console.error('API Error:', error.message || error);
+      return Response.json({ success: false, error: error.message || 'Internal Server Error' }, { status, headers: corsHeaders });
+    };
+
+    const safeQuery = async (sql, params = []) => {
+      try {
+        const stmt = env.DB.prepare(sql);
+        if (params.length > 0) {
+          return await stmt.bind(...params).all();
+        }
+        return await stmt.all();
+      } catch (e) {
+        console.error('SQL Error:', e.message);
+        return { results: [] };
+      }
+    };
+
+    const safeRun = async (sql, params = []) => {
+      try {
+        const stmt = env.DB.prepare(sql);
+        if (params.length > 0) {
+          return await stmt.bind(...params).run();
+        }
+        return await stmt.run();
+      } catch (e) {
+        console.error('SQL Run Error:', e.message);
+        return { success: false, error: e.message };
+      }
+    };
+
+    const safeFirst = async (sql, params = []) => {
+      try {
+        const stmt = env.DB.prepare(sql);
+        if (params.length > 0) {
+          return await stmt.bind(...params).first();
+        }
+        return await stmt.first();
+      } catch (e) {
+        console.error('SQL First Error:', e.message);
+        return null;
+      }
+    };
+
+    const tryFixDB = async () => {
+      const sqls = [
+        `CREATE TABLE IF NOT EXISTS sys_config (id INTEGER PRIMARY KEY, sys_name TEXT, factory_name TEXT, admin_pwd TEXT, contact_info TEXT, order_prefix TEXT)`,
+        `CREATE TABLE IF NOT EXISTS categories (id INTEGER PRIMARY KEY, name TEXT, description TEXT)`,
+        `CREATE TABLE IF NOT EXISTS customer_categories (id INTEGER PRIMARY KEY, name TEXT, description TEXT)`,
+        `CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY, name TEXT, spec TEXT, total_stock INTEGER, daily_rent_price REAL, unit_price REAL, category_id INTEGER, deposit_price REAL, unit TEXT, weight REAL, min_stock INTEGER DEFAULT 0)`,
+        `CREATE TABLE IF NOT EXISTS customers (id INTEGER PRIMARY KEY, name TEXT, balance REAL, contact TEXT, address TEXT, id_card TEXT, project_name TEXT, notes TEXT, category_id INTEGER DEFAULT 0, credit_level TEXT DEFAULT 'NORMAL')`,
+        `CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY, customer_id INTEGER, type TEXT, order_date TEXT, note TEXT, deposit REAL, order_no TEXT)`,
+        `CREATE TABLE IF NOT EXISTS order_items (id INTEGER PRIMARY KEY, order_id INTEGER, product_id INTEGER, quantity INTEGER, daily_rent_price REAL)`,
+        `CREATE TABLE IF NOT EXISTS customer_stocks (id INTEGER PRIMARY KEY, customer_id INTEGER, product_id INTEGER, quantity INTEGER, UNIQUE(customer_id, product_id))`,
+        `CREATE TABLE IF NOT EXISTS payments (id INTEGER PRIMARY KEY, customer_id INTEGER, amount REAL, type TEXT, pay_date TEXT, note TEXT)`,
+        `CREATE TABLE IF NOT EXISTS product_repairs (id INTEGER PRIMARY KEY, product_id INTEGER, repair_date TEXT, description TEXT, cost REAL, status TEXT)`,
+        `CREATE TABLE IF NOT EXISTS bills (id INTEGER PRIMARY KEY, customer_id INTEGER, bill_date TEXT, start_date TEXT, end_date TEXT, total_amount REAL, status TEXT, note TEXT)`,
+        `CREATE TABLE IF NOT EXISTS operation_logs (id INTEGER PRIMARY KEY, operation_type TEXT, operation_desc TEXT, operator TEXT, operation_time TEXT, ip_address TEXT)`,
+        `CREATE TABLE IF NOT EXISTS notifications (id INTEGER PRIMARY KEY, title TEXT, content TEXT, type TEXT, is_read INTEGER DEFAULT 0, create_time TEXT)`
+      ];
+      for (const sql of sqls) {
+        await safeRun(sql);
+      }
+      
+      // 安全添加列的函数
+      const addColumnIfNotExists = async (table, column, type, defaultValue) => {
+        try {
+          // 尝试添加列
+          const sql = `ALTER TABLE ${table} ADD COLUMN ${column} ${type} ${defaultValue ? `DEFAULT ${defaultValue}` : ''}`;
+          await safeRun(sql);
+        } catch (e) {
+          // 忽略重复列错误
+          if (!e.message.includes('duplicate column name')) {
+            console.error(`Error adding column ${column} to ${table}:`, e.message);
+          }
+        }
+      };
+      
+      // 安全添加列
+      await addColumnIfNotExists('products', 'unit_price', 'REAL', '0');
+      await addColumnIfNotExists('products', 'deposit_price', 'REAL', '0');
+      await addColumnIfNotExists('products', 'unit', 'TEXT', `'个'`);
+      await addColumnIfNotExists('products', 'weight', 'REAL', '0');
+      await addColumnIfNotExists('products', 'category_id', 'INTEGER', '0');
+      await addColumnIfNotExists('products', 'min_stock', 'INTEGER', '0');
+      await addColumnIfNotExists('customers', 'contact', 'TEXT', `''`);
+      await addColumnIfNotExists('customers', 'address', 'TEXT', `''`);
+      await addColumnIfNotExists('customers', 'id_card', 'TEXT', `''`);
+      await addColumnIfNotExists('customers', 'project_name', 'TEXT', `''`);
+      await addColumnIfNotExists('customers', 'notes', 'TEXT', `''`);
+      await addColumnIfNotExists('customers', 'category_id', 'INTEGER', '0');
+      await addColumnIfNotExists('customers', 'credit_level', 'TEXT', `'NORMAL'`);
+      await addColumnIfNotExists('orders', 'order_no', 'TEXT', null);
+      await addColumnIfNotExists('order_items', 'daily_rent_price', 'REAL', '0');
+      await addColumnIfNotExists('sys_config', 'contact_info', 'TEXT', `''`);
+      await addColumnIfNotExists('sys_config', 'order_prefix', 'TEXT', `'JSJ'`);
+      
+      // 创建索引
+      const indexes = [
+        `CREATE INDEX IF NOT EXISTS idx_products_category_id ON products(category_id)`,
+        `CREATE INDEX IF NOT EXISTS idx_products_stock ON products(total_stock, min_stock)`,
+        `CREATE INDEX IF NOT EXISTS idx_customers_category_id ON customers(category_id)`,
+        `CREATE INDEX IF NOT EXISTS idx_customers_balance ON customers(balance)`,
+        `CREATE INDEX IF NOT EXISTS idx_orders_customer_id ON orders(customer_id)`,
+        `CREATE INDEX IF NOT EXISTS idx_orders_order_date ON orders(order_date)`,
+        `CREATE INDEX IF NOT EXISTS idx_orders_order_no ON orders(order_no)`,
+        `CREATE INDEX IF NOT EXISTS idx_order_items_order_id ON order_items(order_id)`,
+        `CREATE INDEX IF NOT EXISTS idx_order_items_product_id ON order_items(product_id)`,
+        `CREATE UNIQUE INDEX IF NOT EXISTS idx_customer_stocks_customer_product ON customer_stocks(customer_id, product_id)`,
+        `CREATE INDEX IF NOT EXISTS idx_customer_stocks_customer_id ON customer_stocks(customer_id)`,
+        `CREATE INDEX IF NOT EXISTS idx_customer_stocks_product_id ON customer_stocks(product_id)`,
+        `CREATE INDEX IF NOT EXISTS idx_payments_customer_id ON payments(customer_id)`,
+        `CREATE INDEX IF NOT EXISTS idx_payments_pay_date ON payments(pay_date)`,
+        `CREATE INDEX IF NOT EXISTS idx_product_repairs_product_id ON product_repairs(product_id)`,
+        `CREATE INDEX IF NOT EXISTS idx_product_repairs_repair_date ON product_repairs(repair_date)`,
+        `CREATE INDEX IF NOT EXISTS idx_bills_customer_id ON bills(customer_id)`,
+        `CREATE INDEX IF NOT EXISTS idx_bills_bill_date ON bills(bill_date)`
+      ];
+      for (const sql of indexes) {
+        await safeRun(sql);
+      }
+
+      const has = await safeFirst("SELECT count(*) as c FROM sys_config");
+      if (!has || has.c === 0) {
+        await safeRun("INSERT INTO sys_config (id, sys_name, factory_name, admin_pwd, contact_info, order_prefix) VALUES (1, '脚手架管家', '我的租赁站', 'admin', '', 'JSJ')");
+      }
+    };
+
+    try {
+      await tryFixDB();
+      
+      // 1. 配置
+      if (url.pathname === "/config") {
+        if (method === "GET") {
+          const cacheKey = generateCacheKey("/config", "GET");
+          const cached = getCached(cacheKey);
+          if (cached) {
+            return Response.json(cached, { headers: corsHeaders });
+          }
+          
+          const conf = await safeFirst("SELECT * FROM sys_config WHERE id=1");
+          const result = conf || { sys_name: '脚手架管家', factory_name: '我的租赁站', contact_info: '', order_prefix: 'JSJ' };
+          setCached(cacheKey, result);
+          return Response.json(result, { headers: corsHeaders });
+        }
+        if (method === "POST") {
+          try {
+            const b = await request.json();
+            
+            if (!b.sys_name || b.sys_name.trim() === '') {
+              return Response.json({ error: "系统名称不能为空" }, { status: 400, headers: corsHeaders });
+            }
+            
+            if (!b.old_pwd || b.old_pwd.trim() === '') {
+              return Response.json({ error: "当前密码不能为空" }, { status: 400, headers: corsHeaders });
+            }
+            
+            const verify = await safeFirst("SELECT admin_pwd FROM sys_config WHERE id=1");
+            
+            if (!verify || verify.admin_pwd !== b.old_pwd) {
+              return Response.json({ error: "当前密码错误" }, { status: 403, headers: corsHeaders });
+            }
+            
+            if (b.new_pwd && b.new_pwd.trim() !== '') {
+              if (b.new_pwd.length < 4) {
+                return Response.json({ error: "新密码长度不能少于4位" }, { status: 400, headers: corsHeaders });
+              }
+              if (b.new_pwd !== b.confirm_pwd) {
+                return Response.json({ error: "两次输入的新密码不一致" }, { status: 400, headers: corsHeaders });
+              }
+            }
+            
+            const finalPwd = (b.new_pwd && b.new_pwd.trim() !== '') ? b.new_pwd.trim() : verify.admin_pwd;
+            const sysName = b.sys_name.trim() || '脚手架管家';
+            const factoryName = b.factory_name ? b.factory_name.trim() : '';
+            const contactInfo = b.contact_info ? b.contact_info.trim() : '';
+            const orderPrefix = b.order_prefix ? b.order_prefix.trim() : 'JSJ';
+            
+            await safeRun("UPDATE sys_config SET sys_name=?, factory_name=?, contact_info=?, admin_pwd=?, order_prefix=? WHERE id=1", [sysName, factoryName, contactInfo, finalPwd, orderPrefix]);
+            
+            // 清除配置缓存
+            clearCache("GET:/config");
+            
+            return Response.json({ success: true, message: "配置保存成功" }, { headers: corsHeaders });
+          } catch (error) {
+            return handleError(error);
+          }
+        }
+      }
+
+      // 2. 验证
+      if (url.pathname === "/auth" && method === "POST") {
+        const b = await request.json();
+        if (!b.pwd || b.pwd.trim() === '') {
+          return Response.json({ success: false, error: "密码不能为空" }, { headers: corsHeaders });
+        }
+        const verify = await safeFirst("SELECT id FROM sys_config WHERE id=1 AND admin_pwd=?", [b.pwd.trim()]);
+        return Response.json({ success: !!verify }, { headers: corsHeaders });
+      }
+
+      // 3. 物资分类管理
+      if (url.pathname === "/categories") {
+        if (method === "GET") {
+          const cacheKey = generateCacheKey("/categories", "GET");
+          const cached = getCached(cacheKey);
+          if (cached) {
+            return Response.json(cached, { headers: corsHeaders });
+          }
+          
+          const { results } = await safeQuery("SELECT * FROM categories ORDER BY id DESC");
+          const result = results || [];
+          setCached(cacheKey, result);
+          return Response.json(result, { headers: corsHeaders });
+        }
+        if (method === "POST") {
+          try {
+            const b = await request.json();
+            await safeRun("INSERT INTO categories (name, description) VALUES (?, ?)", [b.name, b.description || '']);
+            clearCache("GET:/categories");
+            return Response.json({ success: true }, { headers: corsHeaders });
+          } catch (error) {
+            return handleError(error);
+          }
+        }
+        if (method === "PUT") {
+          try {
+            const b = await request.json();
+            await safeRun("UPDATE categories SET name=?, description=? WHERE id=?", [b.name, b.description || '', b.id]);
+            clearCache("GET:/categories");
+            return Response.json({ success: true }, { headers: corsHeaders });
+          } catch (error) {
+            return handleError(error);
+          }
+        }
+        if (method === "DELETE") {
+          try {
+            await safeRun("DELETE FROM categories WHERE id=?", [url.searchParams.get("id")]);
+            clearCache("GET:/categories");
+            return Response.json({ success: true }, { headers: corsHeaders });
+          } catch (error) {
+            return handleError(error);
+          }
+        }
+      }
+
+      // 4. 客户分类管理
+      if (url.pathname === "/customer-categories") {
+        if (method === "GET") {
+          const cacheKey = generateCacheKey("/customer-categories", "GET");
+          const cached = getCached(cacheKey);
+          if (cached) {
+            return Response.json(cached, { headers: corsHeaders });
+          }
+          
+          const { results } = await safeQuery("SELECT * FROM customer_categories ORDER BY id DESC");
+          const result = results || [];
+          setCached(cacheKey, result);
+          return Response.json(result, { headers: corsHeaders });
+        }
+        if (method === "POST") {
+          try {
+            const b = await request.json();
+            await safeRun("INSERT INTO customer_categories (name, description) VALUES (?, ?)", [b.name, b.description || '']);
+            clearCache("GET:/customer-categories");
+            return Response.json({ success: true }, { headers: corsHeaders });
+          } catch (error) {
+            return handleError(error);
+          }
+        }
+        if (method === "PUT") {
+          try {
+            const b = await request.json();
+            await safeRun("UPDATE customer_categories SET name=?, description=? WHERE id=?", [b.name, b.description || '', b.id]);
+            clearCache("GET:/customer-categories");
+            return Response.json({ success: true }, { headers: corsHeaders });
+          } catch (error) {
+            return handleError(error);
+          }
+        }
+        if (method === "DELETE") {
+          try {
+            await safeRun("DELETE FROM customer_categories WHERE id=?", [url.searchParams.get("id")]);
+            clearCache("GET:/customer-categories");
+            return Response.json({ success: true }, { headers: corsHeaders });
+          } catch (error) {
+            return handleError(error);
+          }
+        }
+      }
+
+      // 5. 物资 (全字段)
+      if (url.pathname === "/products") {
+        if(method==="GET"){ 
+          const cacheKey = generateCacheKey("/products", "GET");
+          const cached = getCached(cacheKey);
+          if (cached) {
+            return Response.json(cached, { headers: corsHeaders });
+          }
+          
+          const { results } = await safeQuery("SELECT p.*, c.name as category_name FROM products p LEFT JOIN categories c ON p.category_id = c.id ORDER BY p.id DESC");
+          const result = results||[];
+          setCached(cacheKey, result);
+          return Response.json(result, { headers: corsHeaders }); 
+        }
+        if(method==="DELETE"){
+          try {
+            await safeRun("DELETE FROM products WHERE id=?", [url.searchParams.get("id")]);
+            clearCache("GET:/products");
+            clearCache("GET:/products/low-stock");
+            return Response.json({success:true}, { headers: corsHeaders });
+          } catch (error) {
+            return handleError(error);
+          }
+        }
+        try {
+          const b = await request.json();
+          if(method==="POST"){ 
+            await safeRun("INSERT INTO products (name,spec,total_stock,daily_rent_price,unit_price,category_id,deposit_price,unit,weight,min_stock) VALUES (?,?,?,?,?,?,?,?,?,?)", [b.name, b.spec||'', Number(b.total_stock)||0, Number(b.daily_rent_price)||0, Number(b.unit_price)||0, Number(b.category_id)||0, Number(b.deposit_price)||0, b.unit||'个', Number(b.weight)||0, Number(b.min_stock)||0]);
+          } else { 
+            await safeRun("UPDATE products SET name=?,spec=?,total_stock=?,daily_rent_price=?,unit_price=?,category_id=?,deposit_price=?,unit=?,weight=?,min_stock=? WHERE id=?", [b.name, b.spec||'', Number(b.total_stock)||0, Number(b.daily_rent_price)||0, Number(b.unit_price)||0, Number(b.category_id)||0, Number(b.deposit_price)||0, b.unit||'个', Number(b.weight)||0, Number(b.min_stock)||0, b.id]);
+          }
+          clearCache("GET:/products");
+          clearCache("GET:/products/low-stock");
+          return Response.json({ success: true }, { headers: corsHeaders });
+        } catch (error) {
+          return handleError(error);
+        }
+      }
+
+      // 6. 客户 (全字段)
+      if (url.pathname === "/customers") {
+        if (method === "GET") { 
+          const cacheKey = generateCacheKey("/customers", "GET");
+          const cached = getCached(cacheKey);
+          if (cached) {
+            return Response.json(cached, { headers: corsHeaders });
+          }
+          
+          const { results } = await safeQuery("SELECT c.*, cc.name as category_name FROM customers c LEFT JOIN customer_categories cc ON c.category_id = cc.id ORDER BY balance DESC");
+          const result = results||[];
+          setCached(cacheKey, result);
+          return Response.json(result, { headers: corsHeaders }); 
+        }
+        if (method === "DELETE") { 
+          try {
+            await safeRun("DELETE FROM customers WHERE id=?", [url.searchParams.get("id")]);
+            clearCache("GET:/customers");
+            return Response.json({ success: true }, { headers: corsHeaders }); 
+          } catch (error) {
+            return handleError(error);
+          }
+        }
+        try {
+          const b = await request.json();
+          if (method === "POST") { 
+            await safeRun("INSERT INTO customers (name, balance, contact, address, id_card, project_name, notes, category_id, credit_level) VALUES (?, 0, ?, ?, ?, ?, ?, ?, ?)", [b.name, b.contact||'', b.address||'', b.id_card||'', b.project_name||'', b.notes||'', b.category_id||0, b.credit_level||'NORMAL']);
+          } else { 
+            await safeRun("UPDATE customers SET name=?, contact=?, address=?, id_card=?, project_name=?, notes=?, category_id=?, credit_level=? WHERE id=?", [b.name, b.contact||'', b.address||'', b.id_card||'', b.project_name||'', b.notes||'', b.category_id||0, b.credit_level||'NORMAL', b.id]);
+          }
+          clearCache("GET:/customers");
+          return Response.json({ success: true }, { headers: corsHeaders });
+        } catch (error) {
+          return handleError(error);
+        }
+      }
+
+      // 6. 开单
+      if (url.pathname === "/orders" && method === "POST") {
+        try {
+          const b = await request.json(); const time = getBJTime();
+          let prefix = 'JSJ'; try { const c = await env.DB.prepare("SELECT order_prefix FROM sys_config WHERE id=1").first(); if(c) prefix = c.order_prefix; } catch(e){}
+          const countRes = await env.DB.prepare("SELECT count(*) as c FROM orders WHERE substr(order_date, 1, 10) = ?").bind(time.substring(0,10)).first();
+          // 修复订单号生成逻辑，确保countRes.c是数字
+          const orderNo = `${prefix}${time.substring(0, 10).replace(/-/g, '')}${((countRes.c ? countRes.c : 0) + 1).toString().padStart(3, '0')}`;
+
+          // 修复deposit类型处理，确保是数字
+          const deposit = Number(b.deposit) || 0;
+          
+          // 直接执行数据库操作，D1不支持batch方法
+          const res = await env.DB.prepare("INSERT INTO orders (customer_id, type, order_date, note, deposit, order_no) VALUES (?,?,?,?,?,?)").bind(b.customer_id, b.type, time, b.note, deposit, orderNo).run();
+          const oid = res.meta.last_row_id;
+
+          if (deposit > 0) {
+            await env.DB.prepare("INSERT INTO payments (customer_id, amount, type, pay_date, note) VALUES (?, ?, 'DEPOSIT', ?, '开单押金')").bind(b.customer_id, deposit, time).run();
+            await env.DB.prepare("UPDATE customers SET balance = balance + ? WHERE id = ?").bind(deposit, b.customer_id).run();
+          }
+          for (const i of b.items) {
+            await env.DB.prepare("INSERT INTO order_items (order_id, product_id, quantity, daily_rent_price) VALUES (?,?,?,?)").bind(oid, i.product_id, i.qty, i.daily_rent_price).run();
+            const change = b.type === 'OUT' ? -i.qty : i.qty;
+            await env.DB.prepare("UPDATE products SET total_stock = total_stock + ? WHERE id = ?").bind(change, i.product_id).run();
+            const custChange = b.type === 'OUT' ? i.qty : -i.qty;
+            await env.DB.prepare("INSERT INTO customer_stocks (customer_id, product_id, quantity) VALUES (?1, ?2, ?3) ON CONFLICT(customer_id,product_id) DO UPDATE SET quantity = quantity + ?3").bind(b.customer_id, i.product_id, custChange).run();
+          }
+          
+          // 清除相关缓存
+          clearCache("GET:/products");
+          clearCache("GET:/products/low-stock");
+          clearCache("GET:/customers");
+          clearCache("GET:/stats");
+          clearCache("GET:/stats/detailed");
+          
+          return Response.json({ success: true }, { headers: corsHeaders });
+        } catch (error) {
+          return handleError(error);
+        }
+      }
+
+      // 7. 租金计算和账单生成
+      if (url.pathname === "/bills") {
+        if (method === "GET") {
+          const cacheKey = generateCacheKey("/bills", "GET");
+          const cached = getCached(cacheKey);
+          if (cached) {
+            return Response.json(cached, { headers: corsHeaders });
+          }
+          
+          const { results } = await env.DB.prepare("SELECT b.*, c.name as customer_name FROM bills b LEFT JOIN customers c ON b.customer_id = c.id ORDER BY b.id DESC").all();
+          const result = results || [];
+          setCached(cacheKey, result);
+          return Response.json(result, { headers: corsHeaders });
+        }
+        if (method === "POST") {
+          try {
+            const b = await request.json();
+            const time = getBJTime();
+            // 计算租金
+            const { results: stocks } = await env.DB.prepare(`SELECT cs.product_id, cs.quantity, p.daily_rent_price FROM customer_stocks cs JOIN products p ON cs.product_id = p.id WHERE cs.customer_id = ? AND cs.quantity > 0`).bind(b.customer_id).all();
+            
+            // 计算天数
+            const startDate = new Date(b.start_date || new Date());
+            const endDate = new Date(b.end_date || new Date());
+            const days = Math.ceil((endDate.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24));
+            
+            // 计算总租金
+            let totalAmount = 0;
+            for (const stock of stocks) {
+              totalAmount += stock.quantity * stock.daily_rent_price * days;
+            }
+            
+            await env.DB.prepare("INSERT INTO bills (customer_id, bill_date, start_date, end_date, total_amount, status, note) VALUES (?, ?, ?, ?, ?, ?, ?)")
+              .bind(b.customer_id, time, b.start_date, b.end_date, totalAmount, 'UNPAID', b.note || '').run();
+            
+            // 清除相关缓存
+            clearCache("GET:/bills");
+            
+            return Response.json({ success: true, total_amount: totalAmount }, { headers: corsHeaders });
+          } catch (error) {
+            return handleError(error);
+          }
+        }
+        if (method === "PUT") {
+          try {
+            const b = await request.json();
+            
+            // 直接执行数据库操作，D1不支持batch方法
+            await env.DB.prepare("UPDATE bills SET status=? WHERE id=?").bind(b.status, b.id).run();
+            if (b.status === 'PAID') {
+              // 记录付款
+              await env.DB.prepare("INSERT INTO payments (customer_id, amount, type, pay_date, note) VALUES (?, ?, 'RENT', ?, '租金付款')").bind(b.customer_id, b.total_amount, getBJTime()).run();
+              await env.DB.prepare("UPDATE customers SET balance = balance + ? WHERE id = ?").bind(b.total_amount, b.customer_id).run();
+            }
+            
+            // 清除相关缓存
+            clearCache("GET:/bills");
+            clearCache("GET:/customers");
+            clearCache("GET:/stats");
+            clearCache("GET:/stats/detailed");
+            
+            return Response.json({ success: true }, { headers: corsHeaders });
+          } catch (error) {
+            return handleError(error);
+          }
+        }
+      }
+
+      // 8. 库存预警
+      if (url.pathname === "/products/low-stock") {
+        const cacheKey = generateCacheKey("/products/low-stock", "GET");
+        const cached = getCached(cacheKey);
+        if (cached) {
+          return Response.json(cached, { headers: corsHeaders });
+        }
+        
+        try {
+          const { results } = await env.DB.prepare("SELECT * FROM products WHERE total_stock <= min_stock AND min_stock > 0").all();
+          const result = results || [];
+          setCached(cacheKey, result);
+          return Response.json(result, { headers: corsHeaders });
+        } catch (error) {
+          return handleError(error);
+        }
+      }
+
+      // 9. 物资损坏/维修记录
+      if (url.pathname === "/product-repairs") {
+        if (method === "GET") {
+          const productId = url.searchParams.get("product_id");
+          const cacheKey = generateCacheKey("/product-repairs", "GET", { product_id: productId });
+          const cached = getCached(cacheKey);
+          if (cached) {
+            return Response.json(cached, { headers: corsHeaders });
+          }
+          
+          try {
+            let query = "SELECT pr.*, p.name as product_name FROM product_repairs pr LEFT JOIN products p ON pr.product_id = p.id ORDER BY pr.id DESC";
+            let params = [];
+            if (productId) {
+              query = "SELECT pr.*, p.name as product_name FROM product_repairs pr LEFT JOIN products p ON pr.product_id = p.id WHERE pr.product_id = ? ORDER BY pr.id DESC";
+              params = [productId];
+            }
+            const { results } = await env.DB.prepare(query).bind(...params).all();
+            const result = results || [];
+            setCached(cacheKey, result);
+            return Response.json(result, { headers: corsHeaders });
+          } catch (error) {
+            return handleError(error);
+          }
+        }
+        if (method === "POST") {
+          try {
+            const b = await request.json();
+            await env.DB.prepare("INSERT INTO product_repairs (product_id, repair_date, description, cost, status) VALUES (?, ?, ?, ?, ?)")
+              .bind(b.product_id, getBJTime(), b.description, Number(b.cost) || 0, b.status || 'PENDING').run();
+            
+            // 清除相关缓存
+            clearCache("GET:/product-repairs");
+            
+            return Response.json({ success: true }, { headers: corsHeaders });
+          } catch (error) {
+            return handleError(error);
+          }
+        }
+        if (method === "PUT") {
+          try {
+            const b = await request.json();
+            await env.DB.prepare("UPDATE product_repairs SET repair_date=?, description=?, cost=?, status=? WHERE id=?")
+              .bind(b.repair_date, b.description, Number(b.cost) || 0, b.status, b.id).run();
+            
+            // 清除相关缓存
+            clearCache("GET:/product-repairs");
+            
+            return Response.json({ success: true }, { headers: corsHeaders });
+          } catch (error) {
+            return handleError(error);
+          }
+        }
+      }
+
+      // 10. 数据导入导出
+      if (url.pathname === "/export") {
+        try {
+          const type = url.searchParams.get("type");
+          if (type === "products") {
+            const { results } = await env.DB.prepare("SELECT * FROM products").all();
+            return Response.json(results || [], { headers: corsHeaders });
+          }
+          if (type === "customers") {
+            const { results } = await env.DB.prepare("SELECT * FROM customers").all();
+            return Response.json(results || [], { headers: corsHeaders });
+          }
+          if (type === "orders") {
+            const { results } = await env.DB.prepare("SELECT * FROM orders").all();
+            return Response.json(results || [], { headers: corsHeaders });
+          }
+          return Response.json({ error: "Invalid export type" }, { status: 400, headers: corsHeaders });
+        } catch (error) {
+          return handleError(error);
+        }
+      }
+
+      // 11. 数据统计
+      if (url.pathname === "/stats/detailed") {
+        const cacheKey = generateCacheKey("/stats/detailed", "GET");
+        const cached = getCached(cacheKey);
+        if (cached) {
+          return Response.json(cached, { headers: corsHeaders });
+        }
+        
+        try {
+          // 物资分类统计
+          const { results: categoryStats } = await env.DB.prepare(`
+            SELECT c.name as category, COUNT(p.id) as count, SUM(p.total_stock) as total_stock 
+            FROM products p 
+            LEFT JOIN categories c ON p.category_id = c.id 
+            GROUP BY p.category_id 
+            ORDER BY count DESC
+          `).all();
+          
+          // 客户分类统计
+          const { results: customerCategoryStats } = await env.DB.prepare(`
+            SELECT cc.name as category, COUNT(c.id) as count, SUM(c.balance) as total_balance 
+            FROM customers c 
+            LEFT JOIN customer_categories cc ON c.category_id = cc.id 
+            GROUP BY c.category_id 
+            ORDER BY count DESC
+          `).all();
+          
+          // 信用等级统计
+          const { results: creditStats } = await env.DB.prepare(`
+            SELECT credit_level, COUNT(*) as count 
+            FROM customers 
+            GROUP BY credit_level
+          `).all();
+          
+          // 最近7天订单统计
+          const { results: orderStats } = await env.DB.prepare(`
+            SELECT SUBSTR(order_date, 1, 10) as date, COUNT(*) as count, SUM(deposit) as deposit 
+            FROM orders 
+            WHERE order_date >= DATE('now', '-6 days') 
+            GROUP BY SUBSTR(order_date, 1, 10) 
+            ORDER BY date
+          `).all();
+          
+          const result = { 
+            categoryStats, 
+            customerCategoryStats, 
+            creditStats, 
+            orderStats 
+          };
+          
+          setCached(cacheKey, result);
+          return Response.json(result, { headers: corsHeaders });
+        } catch(e) {
+          return handleError(e);
+        }
+      }
+
+      if (url.pathname === "/import" && method === "POST") {
+        const b = await request.json();
+        const type = b.type;
+        const data = b.data;
+        
+        try {
+          // 直接执行数据库操作，D1不支持batch方法
+          if (type === "products") {
+            for (const item of data) {
+              await env.DB.prepare("INSERT INTO products (name, spec, total_stock, daily_rent_price, unit_price, category_id, deposit_price, unit, weight, min_stock) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+                .bind(item.name, item.spec || '', Number(item.total_stock) || 0, Number(item.daily_rent_price) || 0, Number(item.unit_price) || 0, Number(item.category_id) || 0, Number(item.deposit_price) || 0, item.unit || '个', Number(item.weight) || 0, Number(item.min_stock) || 0).run();
+            }
+          }
+          if (type === "customers") {
+            for (const item of data) {
+              await env.DB.prepare("INSERT INTO customers (name, balance, contact, address, id_card, project_name, notes) VALUES (?, ?, ?, ?, ?, ?, ?)")
+                .bind(item.name, Number(item.balance) || 0, item.contact || '', item.address || '', item.id_card || '', item.project_name || '', item.notes || '').run();
+            }
+          }
+          return Response.json({ success: true }, { headers: corsHeaders });
+        } catch (e) {
+          console.error('Import error:', e.message);
+          return Response.json({ success: false, error: e.message }, { status: 500, headers: corsHeaders });
+        }
+      }
+
+      // 其他接口
+      if (url.pathname.match(/^\/orders\/\d+$/)) {
+        const id = url.pathname.split('/')[2];
+        const order = await env.DB.prepare(`SELECT o.*, c.name as customer_name, c.contact as customer_contact, c.address as customer_address FROM orders o LEFT JOIN customers c ON o.customer_id = c.id WHERE o.id = ?`).bind(id).first();
+        const { results: items } = await env.DB.prepare("SELECT p.name, p.spec, oi.quantity, p.unit, oi.daily_rent_price FROM order_items oi JOIN products p ON oi.product_id = p.id WHERE oi.order_id = ?").bind(id).all();
+        return Response.json({ ...order, items }, { headers: corsHeaders });
+      }
+      if (url.pathname.match(/^\/customers\/\d+\/financial$/)) {
+        const id = url.pathname.split('/')[2];
+        const cust = await env.DB.prepare("SELECT * FROM customers WHERE id=?").bind(id).first();
+        const {results:stocks} = await env.DB.prepare(`SELECT p.name, p.spec, cs.quantity, (cs.quantity * p.daily_rent_price) as cost, IFNULL(p.unit_price, 0) as unit_price, p.unit FROM customer_stocks cs JOIN products p ON cs.product_id = p.id WHERE cs.customer_id = ? AND cs.quantity > 0`).bind(id).all();
+        let payments = []; try{payments=(await env.DB.prepare("SELECT * FROM payments WHERE customer_id=? ORDER BY id DESC LIMIT 20").bind(id).all()).results;}catch(e){}
+        const {results:orders} = await env.DB.prepare("SELECT * FROM orders WHERE customer_id=? ORDER BY id DESC LIMIT 10").bind(id).all();
+        const {results:bills} = await env.DB.prepare("SELECT * FROM bills WHERE customer_id=? ORDER BY id DESC LIMIT 10").bind(id).all();
+        return Response.json({ cust, stocks, payments, orders, bills, dailyRent: stocks.reduce((s,x)=>s+(x.cost||0),0) }, { headers: corsHeaders });
+      }
+      if (url.pathname === "/stats") {
+        const cacheKey = generateCacheKey("/stats", "GET");
+        const cached = getCached(cacheKey);
+        if (cached) {
+          return Response.json(cached, { headers: corsHeaders });
+        }
+        
+        try {
+            const {results:r} = await env.DB.prepare("SELECT o.id,o.type,o.order_date,o.order_no,c.name as customer_name FROM orders o JOIN customers c ON o.customer_id=c.id ORDER BY o.id DESC LIMIT 5").all();
+            const i = await env.DB.prepare("SELECT SUM(cs.quantity*p.daily_rent_price) as t FROM customer_stocks cs JOIN products p ON cs.product_id=p.id").first();
+            const s = await env.DB.prepare("SELECT SUM(total_stock) as s FROM products").first();
+            const o = await env.DB.prepare("SELECT SUM(quantity) as o FROM customer_stocks").first();
+            const lowStock = await env.DB.prepare("SELECT COUNT(*) as c FROM products WHERE total_stock <= min_stock AND min_stock > 0").first();
+            
+            const result = { daily_income: i?.t || 0, total_stock: s?.s || 0, total_out: o?.o || 0, low_stock_count: lowStock?.c || 0, recent_orders: r };
+            setCached(cacheKey, result);
+            
+            return Response.json(result, { headers: corsHeaders });
+        } catch(e) { 
+          return handleError(e, 500);
+        }
+      }
+      if (url.pathname === "/payments" && method === "POST") {
+        try {
+          const b = await request.json(); 
+          // 修复amount类型处理
+          const amount = Number(b.amount) || 0;
+          
+          // 直接执行数据库操作，D1不支持batch方法
+          await env.DB.prepare("INSERT INTO payments (customer_id, amount, type, pay_date, note) VALUES (?,?,'MANUAL',?,?)").bind(b.customer_id, amount, getBJTime(), b.note||'').run();
+          await env.DB.prepare("UPDATE customers SET balance = balance + ? WHERE id = ?").bind(amount, b.customer_id).run();
+          
+          // 清除相关缓存
+          clearCache("GET:/customers");
+          clearCache("GET:/stats");
+          clearCache("GET:/stats/detailed");
+          
+          return Response.json({ success: true }, { headers: corsHeaders });
+        } catch (error) {
+          return handleError(error);
+        }
+      }
+      if (url.pathname.match(/^\/products\/\d+\/distribution$/)) {
+        const id = url.pathname.split('/')[2];
+        const {results} = await env.DB.prepare("SELECT c.name, cs.quantity FROM customer_stocks cs JOIN customers c ON cs.customer_id=c.id WHERE cs.product_id=? AND cs.quantity>0").bind(id).all();
+        return Response.json(results || [], { headers: corsHeaders });
+      }
+
+      return new Response("Not Found", { status: 404, headers: corsHeaders });
+    } catch (e) { return Response.json({ error: e.message }, { status: 500, headers: corsHeaders }); }
+  }
+};
