@@ -1,0 +1,27 @@
+{
+  "name": "chuzu",
+  "version": "1.0.0",
+  "description": "脚手架租赁管理系统",
+  "main": "index.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "docker:build": "docker-compose build",
+    "docker:up": "docker-compose up -d",
+    "docker:down": "docker-compose down",
+    "docker:logs": "docker-compose logs -f"
+  },
+  "keywords": [
+    "脚手架",
+    "租赁",
+    "管理",
+    "vue",
+    "cloudflare"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "better-sqlite3": "^9.0.0"
+  },
+  "devDependencies": {}
+}
